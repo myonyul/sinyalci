@@ -16,7 +16,7 @@ from typing import Optional
 
 from binance import ThreadedWebsocketManager
 
-from .data_engine import fetch_ohlcv, fetch_price_change_pct
+from .data_engine import REQUEST_TIMEOUT, fetch_ohlcv, fetch_price_change_pct
 from .strategy_engine import BaseStrategy, get_strategy, print_signal
 
 
@@ -101,6 +101,13 @@ class LiveKlineStream:
                 interval=interval,
                 limit=self.config.history_limit,
             )
+            if df is None or df.empty:
+                print(
+                    f"[{self._timestamp()}] Uyarı — {symbol} için mum verisi boş döndü, "
+                    f"sinyal üretilmedi.",
+                    file=sys.stderr,
+                )
+                return
 
             # Stratejiyi çalıştır ve sonucu terminale yazdır
             print_signal(
@@ -137,15 +144,25 @@ class LiveKlineStream:
         print("  Dinleniyor... (Durdurmak için Ctrl+C)")
         print()
 
-        self._twm = ThreadedWebsocketManager()
-        self._twm.start()
+        try:
+            self._twm = ThreadedWebsocketManager(
+                requests_params={"timeout": REQUEST_TIMEOUT},
+            )
+            self._twm.start()
 
-        # Kline soketini başlat — her yeni mesaj _on_kline_message'a düşer
-        self._conn_key = self._twm.start_kline_socket(
-            callback=self._on_kline_message,
-            symbol=symbol,
-            interval=interval,
-        )
+            # Kline soketini başlat — her yeni mesaj _on_kline_message'a düşer
+            self._conn_key = self._twm.start_kline_socket(
+                callback=self._on_kline_message,
+                symbol=symbol,
+                interval=interval,
+            )
+        except Exception as exc:
+            print(
+                f"[{self._timestamp()}] Uyarı — Binance WebSocket başlatılamadı: {exc}",
+                file=sys.stderr,
+            )
+            self.stop()
+            return
 
         self._running = True
         self._register_shutdown_handlers()

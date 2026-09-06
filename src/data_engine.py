@@ -11,19 +11,38 @@ from typing import Optional
 
 import pandas as pd
 from binance.client import Client
+from binance.exceptions import BinanceAPIException, BinanceRequestException
+from requests.exceptions import RequestException
 
+
+# requests oturumunun süresiz asılı kalmaması için varsayılan zaman aşımı (saniye)
+REQUEST_TIMEOUT = 15
 
 # Binance API istemcisi — geçmiş mum verisi public endpoint olduğu için
 # API anahtarı olmadan da kullanılabilir.
 _client: Optional[Client] = None
+
+_OHLCV_COLUMNS = ["Open", "High", "Low", "Close", "Volume"]
 
 
 def _get_client() -> Client:
     """Tekil (singleton) Binance istemcisini döndürür."""
     global _client
     if _client is None:
-        _client = Client()
+        _client = Client(requests_params={"timeout": REQUEST_TIMEOUT})
+        _client.REQUEST_TIMEOUT = REQUEST_TIMEOUT
     return _client
+
+
+def _empty_ohlcv() -> pd.DataFrame:
+    """Analiz çağrılarının sütun beklediği boş OHLCV çerçevesi."""
+    return pd.DataFrame(columns=_OHLCV_COLUMNS)
+
+
+def _uyari(mesaj: str) -> str:
+    """Uyarıyı terminale yazar ve aynı metni döndürür."""
+    print(f"[Uyarı] {mesaj}")
+    return mesaj
 
 
 def fetch_ohlcv(
@@ -55,11 +74,12 @@ def fetch_ohlcv(
     pd.DataFrame
         Zaman damgası index'li, yalnızca Open, High, Low, Close, Volume
         sütunlarını içeren temizlenmiş veri çerçevesi.
+        Ağ / API hatası veya boş yanıtta boş DataFrame döner (çökmez).
 
     Raises
     ------
     ValueError
-        Geçersiz parametre veya boş veri döndüğünde.
+        Geçersiz parametre verildiğinde.
     """
     # Parite sembolünü Binance formatına uygun hale getir (büyük harf)
     symbol = symbol.upper().strip()
@@ -70,31 +90,60 @@ def fetch_ohlcv(
     if not interval:
         raise ValueError("Zaman dilimi (interval) boş olamaz.")
 
-    client = _get_client()
-
-    # Başlangıç zamanı verilmişse tarih aralığına göre, aksi halde son N muma göre çek
-    if start_time:
-        raw_klines = client.get_historical_klines(
-            symbol=symbol,
-            interval=interval,
-            start_str=start_time,
-            end_str=end_time,
+    try:
+        client = _get_client()
+        # Başlangıç zamanı verilmişse tarih aralığına göre, aksi halde son N muma göre çek
+        if start_time:
+            raw_klines = client.get_historical_klines(
+                symbol=symbol,
+                interval=interval,
+                start_str=start_time,
+                end_str=end_time,
+            )
+        else:
+            # Limit değerini Binance'in izin verdiği aralıkta tut
+            safe_limit = max(1, min(limit, 1000))
+            raw_klines = client.get_klines(
+                symbol=symbol,
+                interval=interval,
+                limit=safe_limit,
+                requests_params={"timeout": REQUEST_TIMEOUT},
+            )
+    except (
+        BinanceAPIException,
+        BinanceRequestException,
+        RequestException,
+        TimeoutError,
+        ValueError,
+        OSError,
+    ) as exc:
+        _uyari(
+            f"'{symbol}' paritesi için '{interval}' mum verisi alınamadı "
+            f"(zaman aşımı veya bağlantı hatası olabilir): {exc}"
         )
-    else:
-        # Limit değerini Binance'in izin verdiği aralıkta tut
-        safe_limit = max(1, min(limit, 1000))
-        raw_klines = client.get_klines(
-            symbol=symbol,
-            interval=interval,
-            limit=safe_limit,
+        return _empty_ohlcv()
+    except Exception as exc:
+        _uyari(
+            f"'{symbol}' paritesi için beklenmeyen mum verisi hatası: {exc}"
         )
+        return _empty_ohlcv()
 
     if not raw_klines:
-        raise ValueError(
-            f"'{symbol}' paritesi için '{interval}' diliminde veri bulunamadı."
+        _uyari(
+            f"'{symbol}' paritesi için '{interval}' diliminde mum verisi boş döndü. "
+            f"Sinyal üretimi atlandı."
         )
+        return _empty_ohlcv()
 
-    return _clean_klines(raw_klines)
+    df = _clean_klines(raw_klines)
+    if df.empty:
+        _uyari(
+            f"'{symbol}' paritesi için '{interval}' diliminde geçerli OHLCV satırı yok. "
+            f"Sinyal üretimi atlandı."
+        )
+        return _empty_ohlcv()
+
+    return df
 
 
 def _clean_klines(raw_klines: list) -> pd.DataFrame:
@@ -167,7 +216,13 @@ def fetch_price_change_pct(symbol: str) -> Optional[float]:
     """
     try:
         client = _get_client()
-        ticker = client.get_ticker(symbol=symbol.upper())
+        ticker = client.get_ticker(
+            symbol=symbol.upper(),
+            requests_params={"timeout": REQUEST_TIMEOUT},
+        )
+        if not ticker:
+            _uyari(f"'{symbol}' için 24 saatlik ticker verisi boş döndü.")
+            return None
         return float(ticker.get("priceChangePercent", 0))
     except Exception:
         return None
