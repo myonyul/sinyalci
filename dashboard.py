@@ -1549,7 +1549,7 @@ def run_market_scan(interval: str, history_limit: int) -> tuple[list[ScanOpportu
         pool_category_size=20,
         interval=interval,
         history_limit=history_limit,
-        request_delay_sec=0.2,
+        request_delay_sec=0.1,
         use_smart_pool=True,
     )
 
@@ -1617,10 +1617,23 @@ def run_market_scan(interval: str, history_limit: int) -> tuple[list[ScanOpportu
             f"🟢 **{long_n} LONG**, 🔴 **{short_n} SHORT**. "
             f"(İncelenen: {stats.incelenen}, atlanan: {stats.atlanan})"
         )
+    elif stats.incelenen == 0:
+        durum_alani.warning(
+            stats.mesaj
+            or (
+                "Tarama sonucu boş. Havuz oluşturulamadı veya taranan "
+                "paritelerin hiçbiri için veri alınamadı."
+            ),
+            icon="⚠️",
+        )
     else:
         durum_alani.info(
-            f"Tarama tamamlandı — LONG veya SHORT sinyali bulunamadı. "
-            f"(İncelenen: {stats.incelenen}, atlanan: {stats.atlanan})"
+            stats.mesaj
+            or (
+                f"Tarama tamamlandı — LONG veya SHORT sinyali bulunamadı. "
+                f"(İncelenen: {stats.incelenen}, atlanan: {stats.atlanan})"
+            ),
+            icon="ℹ️",
         )
 
     return opportunities, stats
@@ -1696,14 +1709,18 @@ def render_radar_tab(interval: str, history_limit: int) -> None:
         )
 
     if not opportunities:
-        st.info(
+        bos_mesaj = (scan_stats.mesaj if scan_stats else "") or (
             "Şu an piyasada LONG veya SHORT sinyali bulunamadı — "
-            "BEKLE modunda kalmanız önerilir.",
-            icon="ℹ️",
+            "BEKLE modunda kalmanız önerilir."
         )
+        if scan_stats and scan_stats.incelenen == 0:
+            st.warning(bos_mesaj, icon="⚠️")
+        else:
+            st.info(bos_mesaj, icon="ℹ️")
         st.caption(
             "Akıllı havuz tarandı ancak strateji koşulları (trend yönü, EMA hizası, "
-            "RSI aralığı ve MACD histogramı) hiçbir seçili paritede tam sağlanmıyor. "
+            "RSI aralığı ve MACD histogramı) hiçbir seçili paritede tam sağlanmıyor "
+            "veya bazı pariteler veri hatası nedeniyle atlandı. "
             "Yukarıdaki **Son Tavsiyeler** bölümünden önceki kayıtları takip edebilirsiniz."
         )
         return

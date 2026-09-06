@@ -39,8 +39,8 @@ BLACKLIST_BASES: frozenset[str] = frozenset(
 # Kaldıraçlı / ters ETF benzeri pariteler
 _EXCLUDED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
-# Her parite taraması sonrası bekleme süresi (saniye) — API sınırı koruması
-_TARAMA_BEKLEME_SANIYE = 0.2
+# Her parite taraması sonrası bekleme süresi (saniye) — Binance rate limit koruması
+_TARAMA_BEKLEME_SANIYE = 0.1
 
 PoolCategory = Literal["trend", "loser", "volume_surge"]
 
@@ -72,6 +72,7 @@ class ScanStats:
     trend_sayisi: int = 0
     loser_sayisi: int = 0
     hacim_patlamasi_sayisi: int = 0
+    mesaj: str = ""
 
     @property
     def toplam_sinyal(self) -> int:
@@ -207,8 +208,15 @@ def fetch_usdt_ticker_candidates(
     try:
         tickers = client.get_ticker()
     except Exception:
-        _log_hata("Binance'ten 24 saatlik ticker verisi alınamadı.")
-        raise
+        _log_hata(
+            "Binance'ten 24 saatlik ticker verisi alınamadı. "
+            "Havuz taraması boş sonuçla sonlanacak, uygulama çalışmaya devam ediyor."
+        )
+        return []
+
+    if not tickers:
+        _log_uyari("Binance 24s ticker yanıtı boş döndü. Taranacak parite yok.")
+        return []
 
     candidates: list[dict[str, Any]] = []
     for ticker in tickers:
@@ -401,13 +409,16 @@ def _analyze_symbol(
     if is_blacklisted_symbol(symbol):
         return None
 
-    # Adım 1: Mum verisi
+    # Adım 1: Mum verisi — boş veya hatalı yanıtta bu coin atlanır
     try:
         df = fetch_ohlcv(symbol=symbol, interval=interval, limit=history_limit)
     except Exception as veri_hatasi:
         raise RuntimeError(
             f"{symbol} için mum verisi alınamadı"
         ) from veri_hatasi
+
+    if df is None or getattr(df, "empty", True):
+        raise RuntimeError(f"{symbol} için mum verisi boş döndü")
 
     # Adım 2: Strateji / indikatör analizi
     try:
@@ -475,7 +486,11 @@ def scan_market(
     cfg = config or ScannerConfig()
     active_strategy = strategy or FuturesTrendStrategy()
     active_risk = risk_config or RiskConfig()
-    bekleme = cfg.request_delay_sec or _TARAMA_BEKLEME_SANIYE
+    bekleme = (
+        cfg.request_delay_sec
+        if cfg.request_delay_sec and cfg.request_delay_sec > 0
+        else _TARAMA_BEKLEME_SANIYE
+    )
 
     if cfg.use_smart_pool:
         _log_bilgi(
@@ -502,12 +517,20 @@ def scan_market(
     try:
         scan_pool = pool_builder()
     except Exception:
-        _log_hata("Parite havuzu oluşturulamadı. Tarama iptal edildi.")
-        return [], ScanStats()
+        mesaj = (
+            "Parite havuzu oluşturulamadı. Binance bağlantısını kontrol edin; "
+            "tarama durduruldu, uygulama çalışmaya devam ediyor."
+        )
+        _log_hata(mesaj)
+        return [], ScanStats(mesaj=mesaj)
 
     if not scan_pool:
-        _log_uyari("Taranacak parite bulunamadı.")
-        return [], ScanStats()
+        mesaj = (
+            "Taranacak parite bulunamadı. 24s ticker boş döndü veya "
+            "filtreler (kara liste / hacim) tüm adayları eledi."
+        )
+        _log_uyari(mesaj)
+        return [], ScanStats(mesaj=mesaj)
 
     pool_trend = sum(1 for item in scan_pool if "trend" in item.get("pool_sources", []))
     pool_loser = sum(1 for item in scan_pool if "loser" in item.get("pool_sources", []))
@@ -554,6 +577,7 @@ def scan_market(
             if opportunity is None:
                 _log_bilgi(f"{symbol} — LONG/SHORT sinyali yok, sonraki pariteye geçiliyor.")
             elif is_blacklisted_symbol(opportunity.symbol):
+                atlanan_sayisi += 1
                 _log_uyari(f"{symbol} kara listede — arayüze yansıtılmıyor, atlanıyor.")
             else:
                 opportunities.append(opportunity)
@@ -569,17 +593,16 @@ def scan_market(
                     f"RSI: {rsi_goster}"
                 )
 
-        except Exception:
+        except Exception as tarama_hatasi:
             atlanan_sayisi += 1
             _log_uyari(
-                f"{symbol} taranırken sorun oluştu "
-                f"(veri çekme veya indikatör hesaplama). "
-                f"Parite atlanıyor, tarama devam ediyor."
+                f"{symbol} atlandı ({tarama_hatasi}). "
+                f"Tarama diğer paritelerle devam ediyor."
             )
             continue
 
         finally:
-            # API hız sınırına takılmamak için her pariteden sonra bekle
+            # Binance rate limit için istekler arası kısa bekleme
             time.sleep(bekleme)
 
     opportunities.sort(key=lambda item: item.volume_24h_usdt, reverse=True)
@@ -590,9 +613,27 @@ def scan_market(
     )
 
     if not opportunities:
-        _log_bilgi(
-            "Şu an LONG veya SHORT sinyali bulunamadı — "
-            "pozisyon açılmaması önerilir."
+        if incelenen_sayisi == 0 and atlanan_sayisi > 0:
+            sonuc_mesaji = (
+                f"Tarama tamamlandı ancak {atlanan_sayisi} paritenin hiçbiri "
+                f"için geçerli mum verisi alınamadı. LONG/SHORT sonucu yok."
+            )
+        elif atlanan_sayisi > 0:
+            sonuc_mesaji = (
+                f"Şu an LONG veya SHORT sinyali bulunamadı "
+                f"(incelenen: {incelenen_sayisi}, atlanan: {atlanan_sayisi}). "
+                f"Pozisyon açılmaması önerilir."
+            )
+        else:
+            sonuc_mesaji = (
+                f"Şu an LONG veya SHORT sinyali bulunamadı "
+                f"(incelenen: {incelenen_sayisi}). Pozisyon açılmaması önerilir."
+            )
+        _log_uyari(sonuc_mesaji)
+    else:
+        sonuc_mesaji = (
+            f"Tarama tamamlandı. İncelenen: {incelenen_sayisi}, "
+            f"atlanan: {atlanan_sayisi}, LONG: {long_sayisi}, SHORT: {short_sayisi}."
         )
 
     stats = ScanStats(
@@ -604,6 +645,7 @@ def scan_market(
         trend_sayisi=pool_trend,
         loser_sayisi=pool_loser,
         hacim_patlamasi_sayisi=pool_surge,
+        mesaj=sonuc_mesaji,
     )
     return opportunities, stats
 
