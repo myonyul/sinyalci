@@ -10,13 +10,19 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+import math
 import time
 from typing import Any, Callable, Literal, Optional
 
 import pandas as pd
 
 from .data_engine import fetch_all_tickers_24hr, fetch_ohlcv
-from .risk_manager import ExitLevels, RiskConfig, calculate_exit_levels_from_signal
+from .risk_manager import (
+    ExitLevels,
+    RiskConfig,
+    calculate_exit_levels_from_signal,
+    estimate_target_eta,
+)
 from .strategy_engine import BaseStrategy, FuturesTrendStrategy, SignalResult, SignalType
 
 
@@ -44,7 +50,7 @@ _TARAMA_BEKLEME_SANIYE = 0.1
 # Akıllı havuz hedefi — örtüşme olursa hacimden tamamlanır
 _MIN_HAVUZ_BOYUTU = 60
 
-PoolCategory = Literal["trend", "loser", "volume_surge"]
+PoolCategory = Literal["trend", "loser", "volume_surge", "dinamik"]
 
 
 @dataclass(frozen=True)
@@ -74,6 +80,7 @@ class ScanStats:
     trend_sayisi: int = 0
     loser_sayisi: int = 0
     hacim_patlamasi_sayisi: int = 0
+    dinamik_sayisi: int = 0
     mesaj: str = ""
 
     @property
@@ -103,6 +110,9 @@ class ScanOpportunity:
     scanned_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     raw_signal: Optional[SignalResult] = None
     exit_levels: Optional[ExitLevels] = None
+    interval: str = "1h"
+    tp1_eta_text: Optional[str] = None
+    tp2_eta_text: Optional[str] = None
 
 
 def _log_bilgi(mesaj: str) -> None:
@@ -175,14 +185,69 @@ def _parse_ticker_row(
         if quote_volume < min_quote_volume:
             return None
 
+        trade_count = float(ticker.get("count", 0) or 0)
+        price_change_pct = float(ticker.get("priceChangePercent", 0))
         return {
             "symbol": symbol,
             "quote_volume": quote_volume,
-            "price_change_pct": float(ticker.get("priceChangePercent", 0)),
+            "price_change_pct": price_change_pct,
             "last_price": float(ticker.get("lastPrice", 0)),
+            "trade_count": trade_count,
+            "activity_score": _activity_score(price_change_pct, quote_volume, trade_count),
         }
     except (TypeError, ValueError):
         return None
+
+
+def _activity_score(
+    price_change_pct: float,
+    quote_volume: float,
+    trade_count: float = 0.0,
+) -> float:
+    """24s fiyat değişimi, hacim ve işlem sayısıyla anlık hareket skoru."""
+    magnitude = abs(float(price_change_pct) or 0.0)
+    volume = max(float(quote_volume) or 0.0, 0.0)
+    trades = max(float(trade_count) or 0.0, 0.0)
+    return magnitude * math.log10(1.0 + volume) * (1.0 + 0.15 * math.log10(1.0 + trades))
+
+
+def _select_dynamic_movers(
+    candidates: list[dict[str, Any]],
+    category_size: int,
+) -> list[dict[str, Any]]:
+    """
+    O an piyasada hareketli coinleri seçer — yalnızca popüler/hacimli olanlar değil.
+
+    Skor: |24s değişim| × log(hacim) × işlem sayısı katkısı.
+    Hacim tabanı medyanın %5'i; değişim eşiği piyasaya göre dinamik.
+    """
+    if not candidates:
+        return []
+
+    volumes = [float(item["quote_volume"]) for item in candidates]
+    changes = [abs(float(item["price_change_pct"])) for item in candidates]
+    volume_floor = max(float(pd.Series(volumes).median()) * 0.05, 50_000.0)
+    change_floor = max(3.0, float(pd.Series(changes).quantile(0.55)))
+
+    hot_count = sum(1 for item in candidates if abs(item["price_change_pct"]) >= 8.0)
+    dinamik_size = min(category_size + min(hot_count // 8, 15), 40)
+
+    hareketliler = [
+        item
+        for item in candidates
+        if item["quote_volume"] >= volume_floor
+        and abs(item["price_change_pct"]) >= change_floor
+    ]
+    if len(hareketliler) < dinamik_size:
+        hareketliler = [
+            item for item in candidates if item["quote_volume"] >= volume_floor
+        ]
+
+    hareketliler.sort(
+        key=lambda item: float(item.get("activity_score") or 0.0),
+        reverse=True,
+    )
+    return hareketliler[:dinamik_size]
 
 
 def fetch_usdt_ticker_candidates(
@@ -232,15 +297,14 @@ def build_smart_coin_pool(
     min_pool_size: int = _MIN_HAVUZ_BOYUTU,
 ) -> list[dict[str, Any]]:
     """
-    Akıllı coin havuzu oluşturur — yükselenler, düşenler ve hacimden
-    dinamik olarak en az ``min_pool_size`` (varsayılan 60) benzersiz USDT paritesi.
+    Akıllı coin havuzu oluşturur — 24s hacim ve fiyat değişimine göre
+    o an hareketli coinleri dinamik olarak dahil eder (hedef 60+).
 
     Kategoriler:
-    - trend: En çok yükselenler (Top Gainers)
-    - loser: En çok düşenler (Top Losers)
+    - trend: En çok yükselenler
+    - loser: En çok düşenler
     - volume_surge: Yüksek hacim, fiyatı henüz aşırı şişmemiş pariteler
-    Örtüşme nedeniyle 60'ın altına düşerse kalan en yüksek hacimli USDT
-    pariteleriyle havuz tamamlanır.
+    - dinamik: |değişim| × log(hacim) skoruyla anlık hareketliler
     """
     candidates = fetch_usdt_ticker_candidates(
         quote_asset=quote_asset,
@@ -288,10 +352,14 @@ def build_smart_coin_pool(
             if len(hacim_patlamasi) >= category_size:
                 break
 
+    # 4) 24s dinamik hareketliler — popüler olmayan ama o an hareket edenler
+    dinamik_olanlar = _select_dynamic_movers(candidates, category_size)
+
     birlesik: list[dict[str, Any]] = []
     gorulen: set[str] = set()
 
     for kaynak, grup in (
+        ("dinamik", dinamik_olanlar),
         ("trend", trend_olanlar),
         ("loser", dusen_bicaklar),
         ("volume_surge", hacim_patlamasi),
@@ -305,6 +373,7 @@ def build_smart_coin_pool(
 
     # Aynı coin birden fazla kategorideyse etiketleri birleştir
     for kaynak, grup in (
+        ("dinamik", dinamik_olanlar),
         ("trend", trend_olanlar),
         ("loser", dusen_bicaklar),
         ("volume_surge", hacim_patlamasi),
@@ -316,26 +385,27 @@ def build_smart_coin_pool(
 
     hedef = max(min_pool_size, category_size)
     if len(birlesik) < hedef:
-        hacim_sirali = sorted(
+        skor_sirali = sorted(
             candidates,
-            key=lambda item: item["quote_volume"],
+            key=lambda item: float(item.get("activity_score") or 0.0),
             reverse=True,
         )
-        for item in hacim_sirali:
+        for item in skor_sirali:
             if item["symbol"] in gorulen:
                 continue
             gorulen.add(item["symbol"])
-            birlesik.append({**item, "pool_sources": ["volume_surge"]})
+            birlesik.append({**item, "pool_sources": ["dinamik"]})
             if len(birlesik) >= hedef:
                 break
         _log_bilgi(
             f"Havuz örtüşme nedeniyle {hedef} altına düştü; "
-            f"hacim sırasından tamamlandı — yeni toplam: {len(birlesik)}."
+            f"24s hareket skorundan tamamlandı — yeni toplam: {len(birlesik)}."
         )
 
     _log_bilgi(
-        f"Akıllı havuz oluşturuldu — trend: {len(trend_olanlar)}, "
-        f"düşen: {len(dusen_bicaklar)}, hacim patlaması: {len(hacim_patlamasi)}, "
+        f"Akıllı havuz oluşturuldu — dinamik: {len(dinamik_olanlar)}, "
+        f"trend: {len(trend_olanlar)}, düşen: {len(dusen_bicaklar)}, "
+        f"hacim patlaması: {len(hacim_patlamasi)}, "
         f"benzersiz toplam: {len(birlesik)} (hedef: {hedef}+)."
     )
     return birlesik
@@ -463,24 +533,42 @@ def _analyze_symbol(
         f"24s değişim: %{ticker_meta['price_change_pct']:+.2f}."
     )
 
+    entry = float(signal_result.close or ticker_meta["last_price"])
+    atr_value = float(signal_result.atr) if signal_result.atr else None
+    tp1 = exit_levels.take_profit_1 if exit_levels else None
+    tp2 = exit_levels.take_profit_2 if exit_levels else None
+    tp1_eta = (
+        estimate_target_eta(entry, tp1, atr_value, interval)
+        if tp1 is not None and atr_value
+        else None
+    )
+    tp2_eta = (
+        estimate_target_eta(entry, tp2, atr_value, interval)
+        if tp2 is not None and atr_value
+        else None
+    )
+
     return ScanOpportunity(
         symbol=symbol,
         signal=signal_result.signal,
         signal_label=signal_label,
-        entry_price=float(signal_result.close or ticker_meta["last_price"]),
+        entry_price=entry,
         current_price=float(ticker_meta["last_price"]),
         rsi=signal_result.rsi,
         atr=signal_result.atr,
         volume_24h_usdt=ticker_meta["quote_volume"],
         price_change_pct_24h=ticker_meta["price_change_pct"],
         stop_loss=exit_levels.stop_loss if exit_levels else None,
-        take_profit_1=exit_levels.take_profit_1 if exit_levels else None,
-        take_profit_2=exit_levels.take_profit_2 if exit_levels else None,
+        take_profit_1=tp1,
+        take_profit_2=tp2,
         reason=reason,
         recommendation=recommendation,
         pool_sources=list(ticker_meta.get("pool_sources") or []),
         raw_signal=signal_result,
         exit_levels=exit_levels,
+        interval=interval,
+        tp1_eta_text=tp1_eta.text if tp1_eta else None,
+        tp2_eta_text=tp2_eta.text if tp2_eta else None,
     )
 
 
@@ -550,6 +638,9 @@ def scan_market(
     pool_surge = sum(
         1 for item in scan_pool if "volume_surge" in item.get("pool_sources", [])
     )
+    pool_dinamik = sum(
+        1 for item in scan_pool if "dinamik" in item.get("pool_sources", [])
+    )
 
     opportunities: list[ScanOpportunity] = []
     total = len(scan_pool)
@@ -560,7 +651,8 @@ def scan_market(
 
     _log_bilgi(
         f"Toplam {total} benzersiz parite akıllı havuzdan analiz edilecek "
-        f"(trend: {pool_trend}, düşen: {pool_loser}, hacim: {pool_surge})."
+        f"(dinamik: {pool_dinamik}, trend: {pool_trend}, düşen: {pool_loser}, "
+        f"hacim: {pool_surge})."
     )
 
     for index, ticker_meta in enumerate(scan_pool):
@@ -658,6 +750,7 @@ def scan_market(
         trend_sayisi=pool_trend,
         loser_sayisi=pool_loser,
         hacim_patlamasi_sayisi=pool_surge,
+        dinamik_sayisi=pool_dinamik,
         mesaj=sonuc_mesaji,
     )
     return opportunities, stats
@@ -696,6 +789,8 @@ def opportunities_to_dataframe(
                 "zarar_durdur",
                 "kar_hedefi_1",
                 "kar_hedefi_2",
+                "kh1_tahmini_sure",
+                "kh2_tahmini_sure",
                 "gerekce",
                 "havuz_kaynaklari",
                 "tavsiye_ozeti",
@@ -716,6 +811,8 @@ def opportunities_to_dataframe(
             "zarar_durdur": opp.stop_loss,
             "kar_hedefi_1": opp.take_profit_1,
             "kar_hedefi_2": opp.take_profit_2,
+            "kh1_tahmini_sure": opp.tp1_eta_text,
+            "kh2_tahmini_sure": opp.tp2_eta_text,
             "gerekce": opp.reason,
             "havuz_kaynaklari": ", ".join(opp.pool_sources) if opp.pool_sources else "—",
             "tavsiye_ozeti": opp.recommendation,

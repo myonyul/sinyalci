@@ -8,9 +8,28 @@ ve kar hedefi seviyelerini hesaplar.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Literal, Union
+from typing import Any, Literal, Optional, Union
 
 from .strategy_engine import SignalResult, SignalType
+
+_INTERVAL_HOURS: dict[str, float] = {
+    "1s": 1.0 / 3600.0,
+    "1m": 1.0 / 60.0,
+    "3m": 3.0 / 60.0,
+    "5m": 5.0 / 60.0,
+    "15m": 0.25,
+    "30m": 0.5,
+    "1h": 1.0,
+    "2h": 2.0,
+    "4h": 4.0,
+    "6h": 6.0,
+    "8h": 8.0,
+    "12h": 12.0,
+    "1d": 24.0,
+    "3d": 72.0,
+    "1w": 168.0,
+    "1M": 720.0,
+}
 
 PositionType = Literal["LONG", "SHORT"]
 SignalInput = Union[str, SignalType, PositionType]
@@ -51,6 +70,88 @@ class ExitLevels:
     def take_profit_2_distance_pct(self) -> float:
         """İkinci kar hedefinin girişe göre yüzde uzaklığı."""
         return ((self.take_profit_2 - self.entry_price) / self.entry_price) * 100
+
+
+@dataclass(frozen=True)
+class TargetEta:
+    """Kar hedefine tahmini ulaşma süresi (ATR / mum)."""
+
+    candles: float
+    hours: float
+    candle_text: str
+    duration_text: str
+    text: str
+
+
+def interval_to_hours(interval: str) -> float:
+    """Binance zaman dilimini saat cinsine çevirir."""
+    text = (interval or "1h").strip()
+    return _INTERVAL_HOURS.get(text, _INTERVAL_HOURS.get(text.lower(), 1.0))
+
+
+def _format_hours(hours: float) -> str:
+    """Saati okunabilir Türkçe süre metnine çevirir."""
+    if hours < 1:
+        minutes = max(1, int(round(hours * 60)))
+        return f"~{minutes} dk"
+    if hours < 24:
+        if hours < 10:
+            return f"~{hours:.1f} saat"
+        return f"~{int(round(hours))} saat"
+    days = hours / 24.0
+    if days < 10:
+        return f"~{days:.1f} gün"
+    return f"~{int(round(days))} gün"
+
+
+def _format_candles(candles: float) -> str:
+    """Ortalama mum sayısını kısa metne çevirir."""
+    if candles < 1:
+        return "<1 mum"
+    if candles >= 200:
+        return "200+ mum"
+    if candles < 10:
+        return f"~{candles:.1f} mum"
+    return f"~{int(round(candles))} mum"
+
+
+def estimate_target_eta(
+    entry_price: float,
+    target_price: float,
+    atr_value: float,
+    interval: str = "1h",
+) -> Optional[TargetEta]:
+    """
+    ATR ve zaman dilimine göre hedefe tahmini ulaşma süresini hesaplar.
+
+    Ortalama mum sayısı = |hedef − giriş| / ATR.
+    Süre (saat) = mum sayısı × dilim süresi.
+    """
+    try:
+        entry = float(entry_price)
+        target = float(target_price)
+        atr = float(atr_value)
+    except (TypeError, ValueError):
+        return None
+
+    if entry <= 0 or atr <= 0:
+        return None
+
+    distance = abs(target - entry)
+    if distance <= 0:
+        return None
+
+    candles = distance / atr
+    hours = candles * interval_to_hours(interval)
+    candle_text = _format_candles(candles)
+    duration_text = _format_hours(hours)
+    return TargetEta(
+        candles=candles,
+        hours=hours,
+        candle_text=candle_text,
+        duration_text=duration_text,
+        text=f"{candle_text} · {duration_text}",
+    )
 
 
 def _normalize_signal_type(signal_type: SignalInput) -> PositionType:
@@ -187,10 +288,28 @@ def calculate_exit_levels_from_signal(
     )
 
 
+def _eta_fields(
+    entry_price: float,
+    target_price: float,
+    atr_value: float,
+    interval: str,
+) -> dict[str, Any]:
+    """Kar hedefi sözlüğüne eklenecek tahmini süre alanları."""
+    eta = estimate_target_eta(entry_price, target_price, atr_value, interval)
+    if eta is None:
+        return {"eta_text": None, "eta_candles": None, "eta_hours": None}
+    return {
+        "eta_text": eta.text,
+        "eta_candles": round(eta.candles, 2),
+        "eta_hours": round(eta.hours, 2),
+    }
+
+
 def to_json_dict(
     levels: ExitLevels,
     symbol: str = "",
     price_precision: int = 4,
+    interval: str = "1h",
 ) -> dict[str, Any]:
     """
     Çıkış seviyelerini JSON uyumlu sözlük olarak döndürür.
@@ -203,6 +322,8 @@ def to_json_dict(
         Parite adı.
     price_precision : int, optional
         Fiyat yuvarlama basamağı.
+    interval : str, optional
+        Mum zaman dilimi — tahmini hedef süresi için.
 
     Returns
     -------
@@ -220,6 +341,7 @@ def to_json_dict(
         "symbol": symbol.upper() if symbol else None,
         "entry_price": _round(levels.entry_price),
         "atr": _round(levels.atr),
+        "interval": interval,
         "stop_loss": {
             "price": _round(levels.stop_loss),
             "atr_multiple": cfg.stop_loss_atr_mult,
@@ -231,12 +353,24 @@ def to_json_dict(
             "atr_multiple": cfg.take_profit_1_atr_mult,
             "distance_pct": round(levels.take_profit_1_distance_pct, 4),
             "label": "Kar Hedefi 1",
+            **_eta_fields(
+                levels.entry_price,
+                levels.take_profit_1,
+                levels.atr,
+                interval,
+            ),
         },
         "take_profit_2": {
             "price": _round(levels.take_profit_2),
             "atr_multiple": cfg.take_profit_2_atr_mult,
             "distance_pct": round(levels.take_profit_2_distance_pct, 4),
             "label": "Kar Hedefi 2",
+            **_eta_fields(
+                levels.entry_price,
+                levels.take_profit_2,
+                levels.atr,
+                interval,
+            ),
         },
         "risk_config": {
             "stop_loss_atr": cfg.stop_loss_atr_mult,
@@ -253,6 +387,7 @@ def build_risk_payload(
     symbol: str = "",
     config: RiskConfig | None = None,
     price_precision: int = 4,
+    interval: str = "1h",
 ) -> dict[str, Any]:
     """
     Giriş, sinyal ve ATR parametrelerinden JSON uyumlu risk sözlüğü üretir.
@@ -283,7 +418,12 @@ def build_risk_payload(
         atr_value=atr_value,
         config=config,
     )
-    payload = to_json_dict(levels, symbol=symbol, price_precision=price_precision)
+    payload = to_json_dict(
+        levels,
+        symbol=symbol,
+        price_precision=price_precision,
+        interval=interval,
+    )
     if payload.get("symbol") is None:
         payload.pop("symbol", None)
     return payload
@@ -294,6 +434,7 @@ def build_risk_payload_from_signal(
     symbol: str = "",
     config: RiskConfig | None = None,
     price_precision: int = 4,
+    interval: str = "1h",
 ) -> dict[str, Any] | None:
     """
     Strateji sinyal sonucundan JSON uyumlu risk sözlüğü üretir.
@@ -324,4 +465,5 @@ def build_risk_payload_from_signal(
         levels,
         symbol=symbol,
         price_precision=price_precision,
+        interval=interval,
     )

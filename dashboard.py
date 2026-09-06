@@ -295,6 +295,16 @@ def inject_custom_css() -> None:
             border: 1px solid rgba(248, 113, 113, 0.3);
             color: #fca5a5;
         }
+        .eta-note {
+            display: inline-block;
+            margin-top: 0.4rem;
+            padding: 0.15rem 0.5rem;
+            border-radius: 999px;
+            background: rgba(255, 255, 255, 0.08);
+            font-size: 0.68rem;
+            font-weight: 600;
+            letter-spacing: 0.01em;
+        }
 
         /* Hata kartı */
         .error-card {
@@ -472,6 +482,11 @@ def card_styles() -> str:
             background: rgba(239, 68, 68, 0.12);
             border: 1px solid rgba(248, 113, 113, 0.3); color: #fca5a5;
         }
+        .eta-note {
+            display: inline-block; margin-top: 0.4rem; padding: 0.15rem 0.5rem;
+            border-radius: 999px; background: rgba(255, 255, 255, 0.08);
+            font-size: 0.68rem; font-weight: 600;
+        }
         .opportunity-card {
             background: linear-gradient(135deg, rgba(16,185,129,0.08) 0%, rgba(255,255,255,0.03) 100%);
             border: 1px solid rgba(52, 211, 153, 0.35);
@@ -598,6 +613,7 @@ def fetch_coin_snapshot(
         risk_payload = build_risk_payload_from_signal(
             signal_result,
             symbol=symbol,
+            interval=interval,
         )
     except Exception:
         # Risk seviyesi hesaplanamazsa kart yine de gösterilir
@@ -1015,10 +1031,12 @@ def render_risk_section(risk: dict[str, Any]) -> str:
         <div class="risk-chip chip-profit">
             <span>{escape(etiket_kar_1)} ({tp1_pct:+.1f}%)</span>
             <strong>{escape(format_price(tp1["price"]))}</strong>
+            {f'<span class="eta-note">⏱ {escape(str(tp1.get("eta_text")))}</span>' if tp1.get("eta_text") else ""}
         </div>
         <div class="risk-chip chip-profit">
             <span>{escape(etiket_kar_2)} ({tp2_pct:+.1f}%)</span>
             <strong>{escape(format_price(tp2["price"]))}</strong>
+            {f'<span class="eta-note">⏱ {escape(str(tp2.get("eta_text")))}</span>' if tp2.get("eta_text") else ""}
         </div>
         <div class="risk-chip chip-stop">
             <span>{escape(etiket_zarar)} ({sl_pct:+.1f}%)</span>
@@ -1081,7 +1099,7 @@ def estimate_card_height(snapshot: CoinSnapshot) -> int:
     if snapshot.error and snapshot.live_price <= 0:
         return 120
     if snapshot.signal_type in (SignalType.LONG, SignalType.BUY, SignalType.SHORT, SignalType.SELL) and snapshot.risk_payload:
-        return 380
+        return 430
     if snapshot.error:
         return 260
     return 220
@@ -1157,6 +1175,11 @@ def opportunity_card_styles(is_long: bool) -> str:
         .opp-reason em {{
             font-style: italic; color: #cbd5e1; display: block; margin-top: 0.35rem;
         }}
+        .eta-note {{
+            display: inline-block; margin-top: 0.4rem; padding: 0.15rem 0.5rem;
+            border-radius: 999px; background: rgba(255, 255, 255, 0.08);
+            color: {accent}; font-size: 0.68rem; font-weight: 600;
+        }}
     </style>
     """
 
@@ -1205,6 +1228,9 @@ def _get_opportunity_tags(opp: ScanOpportunity) -> list[tuple[str, str]]:
 
     if signal_label == "SHORT" and pct >= 10:
         tags.append(("💨 Aşırı Alım Düzeltmesi", "red"))
+
+    if "dinamik" in pool_sources:
+        tags.append(("⚡ 24s dinamik hareket", "violet"))
 
     if "volume_surge" in pool_sources:
         tags.append(("📊 Hacim Patlaması", "blue"))
@@ -1257,6 +1283,14 @@ def build_opportunity_card_html(opp: ScanOpportunity) -> str:
     tp1 = format_price(opp.take_profit_1 or 0) if opp.take_profit_1 else "—"
     tp2 = format_price(opp.take_profit_2 or 0) if opp.take_profit_2 else "—"
     sl = format_price(opp.stop_loss or 0) if opp.stop_loss else "—"
+    tp1_eta = getattr(opp, "tp1_eta_text", None)
+    tp2_eta = getattr(opp, "tp2_eta_text", None)
+    tp1_eta_html = (
+        f'<span class="eta-note">⏱ {escape(tp1_eta)}</span>' if tp1_eta else ""
+    )
+    tp2_eta_html = (
+        f'<span class="eta-note">⏱ {escape(tp2_eta)}</span>' if tp2_eta else ""
+    )
     profit_class = "green" if is_long else "red"
     sl_class = "red" if is_long else "green"
     accent = "#6ee7b7" if is_long else "#fca5a5"
@@ -1286,8 +1320,14 @@ def build_opportunity_card_html(opp: ScanOpportunity) -> str:
             <span class="val {profit_class}">{escape(format_price(opp.entry_price))}</span>
         </div>
         <div class="opp-stat">
-            <label>Kar Hedefi 1 / 2</label>
-            <span class="val {profit_class}">{escape(tp1)} / {escape(tp2)}</span>
+            <label>Kar Hedefi 1</label>
+            <span class="val {profit_class}">{escape(tp1)}</span>
+            {tp1_eta_html}
+        </div>
+        <div class="opp-stat">
+            <label>Kar Hedefi 2</label>
+            <span class="val {profit_class}">{escape(tp2)}</span>
+            {tp2_eta_html}
         </div>
         <div class="opp-stat">
             <label>Zarar Durdur · ATR</label>
@@ -1320,7 +1360,20 @@ def render_opportunity_card(opp: ScanOpportunity) -> None:
         st.error("Pozisyon yönü: **Kısa (SHORT)**", icon="🔻")
 
     render_reason_block(reason)
-    render_html(build_opportunity_card_html(opp), height=300)
+    eta_badges: list[str] = []
+    if getattr(opp, "tp1_eta_text", None):
+        eta_badges.append(f":green-badge[KH1 · {opp.tp1_eta_text}]")
+    if getattr(opp, "tp2_eta_text", None):
+        eta_badges.append(f":blue-badge[KH2 · {opp.tp2_eta_text}]")
+    if eta_badges:
+        interval_label = getattr(opp, "interval", None) or "1h"
+        st.markdown(" ".join(eta_badges))
+        st.caption(
+            f":material/schedule: Tahmini süre, ATR oynaklığı ve `{interval_label}` "
+            f"zaman dilimindeki ortalama mum sayısına göredir."
+        )
+
+    render_html(build_opportunity_card_html(opp), height=340)
 
     render_add_to_watchlist_form(
         symbol=opp.symbol,
@@ -1365,6 +1418,8 @@ def build_radar_export_dataframe(
             "tavsiye_giris",
             "kar_hedefi_1",
             "kar_hedefi_2",
+            "kh1_tahmini_sure",
+            "kh2_tahmini_sure",
             "zarar_durdur",
             "rsi",
             "atr",
@@ -1388,6 +1443,8 @@ def build_radar_export_dataframe(
             "tavsiye_giris": "Tavsiye Giriş",
             "kar_hedefi_1": "Kar Hedefi 1",
             "kar_hedefi_2": "Kar Hedefi 2",
+            "kh1_tahmini_sure": "KH1 Tahmini Süre",
+            "kh2_tahmini_sure": "KH2 Tahmini Süre",
             "zarar_durdur": "Zarar Durdur",
             "rsi": "RSI (14)",
             "atr": "ATR (14)",
@@ -1645,7 +1702,8 @@ def render_radar_tab(interval: str, history_limit: int) -> None:
     st.caption(
         "Trend olanlar (Top 20 yükselen), düşen bıçaklar (Top 20 düşen) ve "
         "hacim patlaması (Top 20 yüksek hacim / düşük fiyat şişmesi) birleştirilerek "
-        "en az 60 benzersiz USDT paritesi taranır. Stablecoin/fiat pariteler kara listededir."
+        "24s hacim ve fiyat değişimine göre o an hareketli coinler dinamik olarak "
+        "dahil edilir (en az 60 benzersiz USDT paritesi). Stablecoin/fiat pariteler kara listededir."
     )
 
     col_btn, col_info = st.columns([1, 2])
@@ -1703,6 +1761,7 @@ def render_radar_tab(interval: str, history_limit: int) -> None:
     if scan_stats:
         st.caption(
             f"Son havuz: **{scan_stats.toplam}** benzersiz coin · "
+            f"Dinamik: {getattr(scan_stats, 'dinamik_sayisi', 0)} · "
             f"Trend: {scan_stats.trend_sayisi} · "
             f"Düşen: {scan_stats.loser_sayisi} · "
             f"Hacim patlaması: {scan_stats.hacim_patlamasi_sayisi}"

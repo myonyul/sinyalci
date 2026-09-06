@@ -18,10 +18,12 @@ from .market_scanner import (
 from .risk_manager import (
     ExitLevels,
     RiskConfig,
+    TargetEta,
     build_risk_payload,
     build_risk_payload_from_signal,
     calculate_exit_levels,
     calculate_exit_levels_from_signal,
+    estimate_target_eta,
     to_json_dict,
 )
 from .strategy_engine import (
@@ -43,6 +45,7 @@ from .strategy_engine import (
 __all__ = [
     "BaseStrategy",
     "ExitLevels",
+    "TargetEta",
     "MarketContext",
     "LiveKlineStream",
     "LiveStreamConfig",
@@ -64,6 +67,7 @@ __all__ = [
     "build_risk_payload_from_signal",
     "calculate_exit_levels",
     "calculate_exit_levels_from_signal",
+    "estimate_target_eta",
     "evaluate_futures",
     "evaluate_signal",
     "fetch_ohlcv",
