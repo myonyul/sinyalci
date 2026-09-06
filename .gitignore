@@ -1,0 +1,8 @@
+# Yerel tavsiye geçmişi (kullanıcıya özel)
+data/recommendations.json
+data/watchlist.json
+
+# Python
+__pycache__/
+*.py[cod]
+.env
