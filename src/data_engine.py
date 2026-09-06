@@ -41,7 +41,11 @@ def _get_session() -> requests.Session:
         session.headers.update(
             {
                 "Accept": "application/json",
-                "User-Agent": "Sinyalci/1.0 (public REST)",
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/122.0.0.0 Safari/537.36"
+                ),
             }
         )
         _session = session
@@ -323,6 +327,18 @@ def _clean_klines(raw_klines: list) -> pd.DataFrame:
     df.columns = ["Open", "High", "Low", "Close", "Volume"]
 
     return df
+
+
+def fetch_all_tickers_24hr() -> list[dict[str, Any]]:
+    """
+    Tüm spot paritelerin 24 saatlik istatistiklerini çeker.
+
+    ``GET https://api.binance.com/api/v3/ticker/24hr`` — API key gerekmez.
+    """
+    payload = _public_get(_TICKER_PATH, {})
+    if not isinstance(payload, list):
+        raise ValueError("Binance 24s ticker yanıtı liste değil.")
+    return payload
 
 
 def fetch_price_change_pct(symbol: str) -> Optional[float]:

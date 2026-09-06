@@ -1645,7 +1645,7 @@ def render_radar_tab(interval: str, history_limit: int) -> None:
     st.caption(
         "Trend olanlar (Top 20 yükselen), düşen bıçaklar (Top 20 düşen) ve "
         "hacim patlaması (Top 20 yüksek hacim / düşük fiyat şişmesi) birleştirilerek "
-        "en fazla 60 benzersiz USDT paritesi taranır. Stablecoin/fiat pariteler kara listededir."
+        "en az 60 benzersiz USDT paritesi taranır. Stablecoin/fiat pariteler kara listededir."
     )
 
     col_btn, col_info = st.columns([1, 2])

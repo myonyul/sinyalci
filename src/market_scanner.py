@@ -14,9 +14,8 @@ import time
 from typing import Any, Callable, Literal, Optional
 
 import pandas as pd
-from binance.client import Client
 
-from .data_engine import fetch_ohlcv
+from .data_engine import fetch_all_tickers_24hr, fetch_ohlcv
 from .risk_manager import ExitLevels, RiskConfig, calculate_exit_levels_from_signal
 from .strategy_engine import BaseStrategy, FuturesTrendStrategy, SignalResult, SignalType
 
@@ -41,6 +40,9 @@ _EXCLUDED_SUFFIXES = ("UPUSDT", "DOWNUSDT", "BULLUSDT", "BEARUSDT")
 
 # Her parite taraması sonrası bekleme süresi (saniye) — Binance rate limit koruması
 _TARAMA_BEKLEME_SANIYE = 0.1
+
+# Akıllı havuz hedefi — örtüşme olursa hacimden tamamlanır
+_MIN_HAVUZ_BOYUTU = 60
 
 PoolCategory = Literal["trend", "loser", "volume_surge"]
 
@@ -101,17 +103,6 @@ class ScanOpportunity:
     scanned_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     raw_signal: Optional[SignalResult] = None
     exit_levels: Optional[ExitLevels] = None
-
-
-_client: Optional[Client] = None
-
-
-def _get_client() -> Client:
-    """Tekil Binance istemcisini döndürür."""
-    global _client
-    if _client is None:
-        _client = Client()
-    return _client
 
 
 def _log_bilgi(mesaj: str) -> None:
@@ -203,13 +194,11 @@ def fetch_usdt_ticker_candidates(
 
     Kara listedeki stablecoin/fiat bazlı pariteler filtrelenir.
     """
-    client = _get_client()
-
     try:
-        tickers = client.get_ticker()
+        tickers = fetch_all_tickers_24hr()
     except Exception:
         _log_hata(
-            "Binance'ten 24 saatlik ticker verisi alınamadı. "
+            "Binance halka açık /api/v3/ticker/24hr uç noktasından veri alınamadı. "
             "Havuz taraması boş sonuçla sonlanacak, uygulama çalışmaya devam ediyor."
         )
         return []
@@ -240,14 +229,18 @@ def build_smart_coin_pool(
     quote_asset: str = "USDT",
     min_quote_volume: float = 0.0,
     volume_surge_max_change_pct: float = 8.0,
+    min_pool_size: int = _MIN_HAVUZ_BOYUTU,
 ) -> list[dict[str, Any]]:
     """
-    Akıllı coin havuzu oluşturur — en fazla 3×category_size benzersiz parite.
+    Akıllı coin havuzu oluşturur — yükselenler, düşenler ve hacimden
+    dinamik olarak en az ``min_pool_size`` (varsayılan 60) benzersiz USDT paritesi.
 
     Kategoriler:
     - trend: En çok yükselenler (Top Gainers)
     - loser: En çok düşenler (Top Losers)
     - volume_surge: Yüksek hacim, fiyatı henüz aşırı şişmemiş pariteler
+    Örtüşme nedeniyle 60'ın altına düşerse kalan en yüksek hacimli USDT
+    pariteleriyle havuz tamamlanır.
     """
     candidates = fetch_usdt_ticker_candidates(
         quote_asset=quote_asset,
@@ -321,10 +314,29 @@ def build_smart_coin_pool(
             if entry["symbol"] in grup_sembolleri and kaynak not in entry["pool_sources"]:
                 entry["pool_sources"].append(kaynak)
 
+    hedef = max(min_pool_size, category_size)
+    if len(birlesik) < hedef:
+        hacim_sirali = sorted(
+            candidates,
+            key=lambda item: item["quote_volume"],
+            reverse=True,
+        )
+        for item in hacim_sirali:
+            if item["symbol"] in gorulen:
+                continue
+            gorulen.add(item["symbol"])
+            birlesik.append({**item, "pool_sources": ["volume_surge"]})
+            if len(birlesik) >= hedef:
+                break
+        _log_bilgi(
+            f"Havuz örtüşme nedeniyle {hedef} altına düştü; "
+            f"hacim sırasından tamamlandı — yeni toplam: {len(birlesik)}."
+        )
+
     _log_bilgi(
         f"Akıllı havuz oluşturuldu — trend: {len(trend_olanlar)}, "
         f"düşen: {len(dusen_bicaklar)}, hacim patlaması: {len(hacim_patlamasi)}, "
-        f"benzersiz toplam: {len(birlesik)}."
+        f"benzersiz toplam: {len(birlesik)} (hedef: {hedef}+)."
     )
     return birlesik
 
@@ -502,6 +514,7 @@ def scan_market(
             quote_asset=cfg.quote_asset,
             min_quote_volume=cfg.min_quote_volume,
             volume_surge_max_change_pct=cfg.volume_surge_max_change_pct,
+            min_pool_size=_MIN_HAVUZ_BOYUTU,
         )
     else:
         _log_bilgi(
