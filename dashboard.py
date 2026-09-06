@@ -22,7 +22,6 @@ from typing import Any, Optional
 import streamlit as st
 import streamlit.components.v1 as components
 import pandas as pd
-from streamlit_autorefresh import st_autorefresh
 
 from src import (
     ScanOpportunity,
@@ -47,9 +46,8 @@ from src.watchlist_store import (
     upsert_watchlist_position,
 )
 
-# Otomatik yenileme aralığı (milisaniye)
-REFRESH_INTERVAL_MS = 10_000
-REFRESH_INTERVAL_SEC = REFRESH_INTERVAL_MS // 1000
+# Kart alanı otomatik yenileme — yalnızca @st.fragment, tam sayfa rerun yok
+REFRESH_INTERVAL_SEC = 10
 
 # Coin başına kısa bekleme — API rate limit koruması
 API_REQUEST_DELAY_SEC = 0.15
@@ -1514,46 +1512,11 @@ def opportunities_to_excel_bytes(opportunities: list[ScanOpportunity]) -> bytes:
     return buffer.getvalue()
 
 
-def render_watchlist_tab(
+def _render_watchlist_card_grid(
     symbols: list[str],
-    interval: str,
-    history_limit: int,
-    refresh_count: int,
+    snapshots: dict[str, CoinSnapshot],
 ) -> None:
-    """İzleme listesi sekmesini çizer."""
-    if not symbols:
-        st.info("Başlamak için yan menüden en az bir parite ekleyin.")
-        return
-
-    if st.session_state.get("scan_in_progress", False):
-        st.info("Piyasa taraması devam ediyor. İzleme listesi tarama bitince güncellenecek.")
-        snapshots = st.session_state.get("snapshots", {})
-        if snapshots:
-            render_status_bar(refresh_count=refresh_count, has_stale=False)
-            for row_start in range(0, len(symbols), 2):
-                cols = st.columns(2)
-                for col_idx, symbol in enumerate(symbols[row_start : row_start + 2]):
-                    with cols[col_idx]:
-                        snapshot = snapshots.get(symbol)
-                        if snapshot:
-                            render_metric_card(snapshot)
-        return
-
-    try:
-        snapshots = refresh_all_snapshots(
-            symbols=symbols,
-            interval=interval,
-            history_limit=history_limit,
-        )
-        st.session_state.snapshots = snapshots
-        st.session_state.last_refresh_at = utc_now()
-    except Exception:
-        st.error("Veri yenileme döngüsü başarısız oldu. Önceki veriler gösteriliyor.")
-        snapshots = st.session_state.get("snapshots", {})
-
-    has_stale = any(s.is_stale for s in snapshots.values())
-    render_status_bar(refresh_count=refresh_count, has_stale=has_stale)
-
+    """İzleme listesi fiyat kartlarını çizer (fragment içinde kullanılır)."""
     if not snapshots:
         st.warning("Henüz gösterilecek veri yok. Lütfen birkaç saniye bekleyin.")
         return
@@ -1598,6 +1561,65 @@ def render_watchlist_tab(
 """,
                         height=120,
                     )
+
+
+@st.fragment(run_every=REFRESH_INTERVAL_SEC, key="watchlist_live_cards")
+def render_live_price_cards(
+    symbols: list[str],
+    interval: str,
+    history_limit: int,
+) -> None:
+    """
+    Yalnızca fiyat kartlarını 10 saniyede bir yeniler.
+
+    Tam sayfa rerun yapmaz; yan menü, başlık ve radar sekmesi yerinde kalır.
+    """
+    refresh_count = int(st.session_state.get("watchlist_refresh_count", 0)) + 1
+    st.session_state.watchlist_refresh_count = refresh_count
+
+    try:
+        snapshots = refresh_all_snapshots(
+            symbols=symbols,
+            interval=interval,
+            history_limit=history_limit,
+        )
+        st.session_state.snapshots = snapshots
+        st.session_state.last_refresh_at = utc_now()
+    except Exception:
+        st.error("Veri yenileme döngüsü başarısız oldu. Önceki veriler gösteriliyor.")
+        snapshots = st.session_state.get("snapshots", {})
+
+    has_stale = any(s.is_stale for s in snapshots.values()) if snapshots else False
+    render_status_bar(refresh_count=refresh_count, has_stale=has_stale)
+    _render_watchlist_card_grid(symbols, snapshots)
+
+
+def render_watchlist_tab(
+    symbols: list[str],
+    interval: str,
+    history_limit: int,
+) -> None:
+    """İzleme listesi sekmesini çizer."""
+    if not symbols:
+        st.info("Başlamak için yan menüden en az bir parite ekleyin.")
+        return
+
+    if st.session_state.get("scan_in_progress", False):
+        st.info("Piyasa taraması devam ediyor. İzleme listesi tarama bitince güncellenecek.")
+        snapshots = st.session_state.get("snapshots", {})
+        if snapshots:
+            render_status_bar(
+                refresh_count=int(st.session_state.get("watchlist_refresh_count", 0)),
+                has_stale=False,
+            )
+            _render_watchlist_card_grid(symbols, snapshots)
+        return
+
+    render_live_price_cards(
+        symbols=symbols,
+        interval=interval,
+        history_limit=history_limit,
+    )
 
 
 def run_market_scan(interval: str, history_limit: int) -> tuple[list[ScanOpportunity], ScanStats]:
@@ -1910,7 +1932,8 @@ def render_sidebar() -> tuple[list[str], str, int]:
             f"""
             <p style="color:#64748b; font-size:0.78rem; margin-top:1rem;">
             Veriler Binance borsasından çekilir.<br>
-            Otomatik yenileme: <strong>{REFRESH_INTERVAL_SEC} saniye</strong>
+            Fiyat kartları: <strong>{REFRESH_INTERVAL_SEC} saniyede bir</strong>
+            (sayfa yenilenmez)
             </p>
             """
         ).strip(),
@@ -1934,7 +1957,7 @@ def render_status_bar(refresh_count: int, has_stale: bool) -> None:
         f"""
 <div class="status-bar">
     <span class="{dot_class}"></span>
-    <span>Otomatik yenileme açık · {REFRESH_INTERVAL_SEC} saniye ·
+    <span>Kartlar 10 sn'de bir yenilenir (sayfa sabit) ·
     Döngü no: {refresh_count} · Son güncelleme: {escape(time_text)}</span>
 </div>
 """
@@ -1951,18 +1974,6 @@ def main() -> None:
     )
 
     hide_streamlit_chrome()
-
-    # Tarama sırasında otomatik yenilemeyi durdur (ilerleme çubuğu stabil kalsın)
-    if not st.session_state.get("scan_in_progress", False):
-        refresh_count = st_autorefresh(
-            interval=REFRESH_INTERVAL_MS,
-            limit=None,
-            key="sinyalci_autorefresh",
-        )
-    else:
-        refresh_count = st.session_state.get("refresh_count", 0)
-
-    st.session_state.refresh_count = refresh_count
 
     inject_custom_css()
     ensure_recommendation_history_loaded()
@@ -1989,19 +2000,27 @@ def main() -> None:
     symbols, interval, history_limit = render_sidebar()
 
     tab_watchlist, tab_radar = st.tabs(
-        ["👀 İzleme Listem", "🚀 Piyasa Radarı & Tavsiyeler"]
+        ["👀 İzleme Listem", "🚀 Piyasa Radarı & Tavsiyeler"],
+        on_change="rerun",
+        key="main_tabs",
     )
 
-    with tab_watchlist:
-        render_watchlist_tab(
-            symbols=symbols,
-            interval=interval,
-            history_limit=history_limit,
-            refresh_count=refresh_count,
-        )
+    watch_open = tab_watchlist.open
+    radar_open = tab_radar.open
+    if watch_open is None and radar_open is None:
+        watch_open = True
 
-    with tab_radar:
-        render_radar_tab(interval=interval, history_limit=history_limit)
+    if watch_open:
+        with tab_watchlist:
+            render_watchlist_tab(
+                symbols=symbols,
+                interval=interval,
+                history_limit=history_limit,
+            )
+
+    if radar_open:
+        with tab_radar:
+            render_radar_tab(interval=interval, history_limit=history_limit)
 
 
 if __name__ == "__main__":
