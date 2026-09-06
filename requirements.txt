@@ -2,16 +2,23 @@
 # Kurulum: pip install -r requirements.txt
 
 # Binance REST API ve WebSocket (ThreadedWebsocketManager)
-python-binance>=1.0.19,<2.0.0
+#python-binance>=1.0.19,<2.0.0
 
 # Veri işleme
-pandas>=2.0.0,<4.0.0
-numpy>=1.26.0,<3.0.0
+#pandas>=2.0.0,<4.0.0
+#numpy>=1.26.0,<3.0.0
 
 # Teknik indikatörler (RSI, MACD vb.)
-pandas-ta>=0.3.14b0
+#pandas-ta>=0.3.14b0
 
 # Web dashboard
-streamlit>=1.28.0,<2.0.0
-streamlit-autorefresh>=1.0.1,<2.0.0
-openpyxl>=3.1.0,<4.0.0
+#streamlit>=1.28.0,<2.0.0
+#streamlit-autorefresh>=1.0.1,<2.0.0
+#openpyxl>=3.1.0,<4.0.0
+
+
+streamlit
+pandas
+numpy
+python-binance
+pandas_ta
