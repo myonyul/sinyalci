@@ -13,8 +13,8 @@ from enum import Enum
 import sys
 from typing import Any, Literal, Optional
 
+import numpy as np
 import pandas as pd
-import pandas_ta as ta
 
 SignalLabel = Literal["LONG", "SHORT", "BEKLE"]
 
@@ -141,8 +141,71 @@ def _validate_ohlcv(df: pd.DataFrame) -> None:
         )
 
 
+def _ema(close: pd.Series, length: int) -> pd.Series:
+    """Üstel hareketli ortalama (adjust=False, TradingView / klasik TA uyumlu)."""
+    return close.ewm(span=length, adjust=False).mean()
+
+
+def _rma(series: pd.Series, length: int) -> pd.Series:
+    """Wilder RMA — RSI ve ATR yumuşatması (alpha = 1/length)."""
+    return series.ewm(alpha=1.0 / length, adjust=False, min_periods=length).mean()
+
+
+def _rsi(close: pd.Series, length: int) -> pd.Series:
+    """Wilder RSI."""
+    delta = close.diff()
+    gain = delta.clip(lower=0.0)
+    loss = (-delta).clip(lower=0.0)
+    avg_gain = _rma(gain, length)
+    avg_loss = _rma(loss, length)
+    rs = avg_gain / avg_loss.replace(0.0, np.nan)
+    return 100.0 - (100.0 / (1.0 + rs))
+
+
+def _macd(
+    close: pd.Series,
+    fast: int,
+    slow: int,
+    signal: int,
+) -> pd.DataFrame:
+    """MACD çizgisi, sinyal çizgisi ve histogram."""
+    fast_ema = _ema(close, fast)
+    slow_ema = _ema(close, slow)
+    macd_line = fast_ema - slow_ema
+    signal_line = _ema(macd_line, signal)
+    histogram = macd_line - signal_line
+    suffix = f"{fast}_{slow}_{signal}"
+    return pd.DataFrame(
+        {
+            f"MACD_{suffix}": macd_line,
+            f"MACDs_{suffix}": signal_line,
+            f"MACDh_{suffix}": histogram,
+        },
+        index=close.index,
+    )
+
+
+def _atr(
+    high: pd.Series,
+    low: pd.Series,
+    close: pd.Series,
+    length: int,
+) -> pd.Series:
+    """Ortalama Gerçek Aralık (Wilder ATR)."""
+    prev_close = close.shift(1)
+    true_range = pd.concat(
+        [
+            high - low,
+            (high - prev_close).abs(),
+            (low - prev_close).abs(),
+        ],
+        axis=1,
+    ).max(axis=1)
+    return _rma(true_range, length)
+
+
 def _macd_columns(config: FuturesStrategyConfig) -> tuple[str, str, str]:
-    """pandas-ta MACD sütun adlarını döndürür."""
+    """MACD sütun adlarını döndürür."""
     suffix = f"{config.macd_fast}_{config.macd_slow}_{config.macd_signal}"
     return (
         f"MACD_{suffix}",
@@ -164,26 +227,26 @@ def add_indicators(
     cfg = config or FuturesStrategyConfig()
     result = df.copy()
 
-    result[f"EMA_{cfg.ema_fast}"] = ta.ema(result["Close"], length=cfg.ema_fast)
-    result[f"EMA_{cfg.ema_mid}"] = ta.ema(result["Close"], length=cfg.ema_mid)
-    result[f"EMA_{cfg.ema_slow}"] = ta.ema(result["Close"], length=cfg.ema_slow)
-    result[f"RSI_{cfg.rsi_period}"] = ta.rsi(result["Close"], length=cfg.rsi_period)
+    result[f"EMA_{cfg.ema_fast}"] = _ema(result["Close"], cfg.ema_fast)
+    result[f"EMA_{cfg.ema_mid}"] = _ema(result["Close"], cfg.ema_mid)
+    result[f"EMA_{cfg.ema_slow}"] = _ema(result["Close"], cfg.ema_slow)
+    result[f"RSI_{cfg.rsi_period}"] = _rsi(result["Close"], cfg.rsi_period)
 
-    macd_df = ta.macd(
+    macd_df = _macd(
         result["Close"],
         fast=cfg.macd_fast,
         slow=cfg.macd_slow,
         signal=cfg.macd_signal,
     )
-    if macd_df is None:
+    if macd_df.isna().all().all():
         raise ValueError("MACD hesaplanamadı — yeterli veri olmayabilir.")
     result = pd.concat([result, macd_df], axis=1)
 
-    result[f"ATR_{cfg.atr_period}"] = ta.atr(
+    result[f"ATR_{cfg.atr_period}"] = _atr(
         result["High"],
         result["Low"],
         result["Close"],
-        length=cfg.atr_period,
+        cfg.atr_period,
     )
 
     return result
