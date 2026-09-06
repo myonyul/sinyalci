@@ -30,11 +30,13 @@ from src import (
     build_risk_payload_from_signal,
     evaluate_signal,
     fetch_ohlcv,
+    fetch_live_tickers,
     fetch_price_change_pct,
     opportunities_to_dataframe,
     scan_market,
 )
 from src.market_scanner import ScanStats, is_blacklisted_symbol
+from src.risk_manager import calculate_exit_levels, estimate_target_eta
 from src.recommendation_store import (
     clear_recommendation_history,
     get_history_file_path,
@@ -1718,6 +1720,260 @@ def run_market_scan(interval: str, history_limit: int) -> tuple[list[ScanOpportu
     return opportunities, stats
 
 
+def _apply_live_levels(
+    opp: ScanOpportunity,
+    live_price: float,
+    atr_value: Optional[float],
+    signal_label: str,
+    interval: str,
+) -> dict[str, Any]:
+    """Anlık fiyat ve ATR ile kar hedefi / zarar durdur / ETA üretir."""
+    levels = None
+    if live_price > 0 and atr_value and atr_value > 0 and signal_label in ("LONG", "SHORT"):
+        try:
+            levels = calculate_exit_levels(live_price, signal_label, atr_value)
+        except Exception:
+            levels = getattr(opp, "exit_levels", None)
+
+    tp1 = levels.take_profit_1 if levels else opp.take_profit_1
+    tp2 = levels.take_profit_2 if levels else opp.take_profit_2
+    sl = levels.stop_loss if levels else opp.stop_loss
+    tp1_eta = (
+        estimate_target_eta(live_price, tp1, atr_value, interval)
+        if tp1 and atr_value
+        else None
+    )
+    tp2_eta = (
+        estimate_target_eta(live_price, tp2, atr_value, interval)
+        if tp2 and atr_value
+        else None
+    )
+    return {
+        "exit_levels": levels or opp.exit_levels,
+        "take_profit_1": tp1,
+        "take_profit_2": tp2,
+        "stop_loss": sl,
+        "tp1_eta_text": tp1_eta.text if tp1_eta else opp.tp1_eta_text,
+        "tp2_eta_text": tp2_eta.text if tp2_eta else opp.tp2_eta_text,
+    }
+
+
+def refresh_radar_opportunities(
+    opportunities: list[ScanOpportunity],
+    interval: str,
+    history_limit: int,
+) -> list[ScanOpportunity]:
+    """
+    Radar kartlarındaki fiyat, hedef ve durumu Binance anlık verisiyle yeniler.
+
+    Önce tek istekle son fiyatlar alınır; ardından her coin için strateji
+    ve ATR tabanlı kar hedefleri yeniden hesaplanır.
+    """
+    if not opportunities:
+        return []
+
+    symbols = [opp.symbol for opp in opportunities]
+    try:
+        tickers = fetch_live_tickers(symbols)
+    except Exception:
+        tickers = {}
+
+    refreshed: list[ScanOpportunity] = []
+    for opp in opportunities:
+        ticker = tickers.get(opp.symbol.upper(), {})
+        live_price = float(ticker.get("last_price") or opp.current_price or 0)
+        change_pct = ticker.get("price_change_pct")
+        quote_volume = ticker.get("quote_volume")
+        atr_value = opp.atr
+        signal_label = _opp_signal_label(opp)
+        signal_type = opp.signal
+        raw_signal = opp.raw_signal
+        rsi = opp.rsi
+        reason = opp.reason
+
+        try:
+            df = fetch_ohlcv(
+                symbol=opp.symbol,
+                interval=interval or getattr(opp, "interval", "1h"),
+                limit=history_limit,
+            )
+            if df is not None and not df.empty:
+                candle_close = float(df["Close"].iloc[-1])
+                if live_price <= 0 and candle_close > 0:
+                    live_price = candle_close
+                signal_result = evaluate_signal(
+                    df,
+                    price_change_pct_24h=(
+                        float(change_pct)
+                        if change_pct is not None
+                        else opp.price_change_pct_24h
+                    ),
+                )
+                raw_signal = signal_result
+                if signal_result.rsi is not None:
+                    rsi = signal_result.rsi
+                if signal_result.atr is not None:
+                    atr_value = signal_result.atr
+                if signal_result.signal_label in ("LONG", "SHORT"):
+                    signal_label = signal_result.signal_label
+                    signal_type = signal_result.signal
+                if signal_result.message:
+                    reason = signal_result.message
+                time.sleep(0.05)
+        except Exception:
+            pass
+
+        level_fields = _apply_live_levels(
+            opp,
+            live_price=live_price,
+            atr_value=atr_value,
+            signal_label=signal_label,
+            interval=interval or getattr(opp, "interval", "1h"),
+        )
+        refreshed.append(
+            replace(
+                opp,
+                current_price=live_price,
+                rsi=rsi,
+                atr=atr_value,
+                volume_24h_usdt=(
+                    float(quote_volume)
+                    if quote_volume
+                    else opp.volume_24h_usdt
+                ),
+                price_change_pct_24h=(
+                    float(change_pct)
+                    if change_pct is not None
+                    else opp.price_change_pct_24h
+                ),
+                signal=signal_type,
+                signal_label=signal_label,
+                reason=reason,
+                raw_signal=raw_signal,
+                interval=interval or getattr(opp, "interval", "1h"),
+                **level_fields,
+            )
+        )
+
+    return refreshed
+
+
+def _render_radar_results(
+    opportunities: list[ScanOpportunity],
+    scan_stats: Optional[ScanStats],
+) -> None:
+    """Radar özet tablosu ve tavsiye kartlarını çizer."""
+    long_opps = [o for o in opportunities if _opp_signal_label(o) == "LONG"]
+    short_opps = [o for o in opportunities if _opp_signal_label(o) == "SHORT"]
+
+    pool_size = scan_stats.toplam if scan_stats else len(opportunities)
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Taranan Havuz", pool_size)
+    m2.metric("🟢 LONG", len(long_opps))
+    m3.metric("🔴 SHORT", len(short_opps))
+    if scan_stats:
+        m4.metric(
+            "Havuz Kaynağı",
+            f"T{scan_stats.trend_sayisi}/D{scan_stats.loser_sayisi}/H{scan_stats.hacim_patlamasi_sayisi}",
+            help="Trend / Düşen / Hacim patlaması kategorilerindeki parite sayıları",
+        )
+    else:
+        m4.metric("Toplam Sinyal", len(opportunities))
+
+    table_title_col, table_export_col = st.columns([3, 1])
+    with table_title_col:
+        st.markdown(f"#### Aktif Fırsatlar ({len(opportunities)} sinyal)")
+    with table_export_col:
+        export_filename = (
+            f"sinyalci_firsatlar_{utc_now().strftime('%Y%m%d_%H%M')}.xlsx"
+        )
+        st.download_button(
+            label="📥 Excel İndir",
+            data=opportunities_to_excel_bytes(opportunities),
+            file_name=export_filename,
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            width="stretch",
+            key="download_radar_excel",
+        )
+
+    display_df = build_radar_export_dataframe(opportunities).drop(
+        columns=["Taranma Zamanı"]
+    )
+    st.dataframe(
+        _style_radar_dataframe(display_df),
+        hide_index=True,
+    )
+
+    st.markdown("---")
+
+    if long_opps:
+        st.markdown("#### 🔥 Uzun (LONG) Fırsatları")
+        for row_start in range(0, len(long_opps), 2):
+            cols = st.columns(2)
+            for col_idx, opp in enumerate(long_opps[row_start : row_start + 2]):
+                with cols[col_idx]:
+                    render_opportunity_card(opp)
+
+    if short_opps:
+        if long_opps:
+            st.markdown("---")
+        st.markdown("#### 📉 Kısa (SHORT) Fırsatları")
+        for row_start in range(0, len(short_opps), 2):
+            cols = st.columns(2)
+            for col_idx, opp in enumerate(short_opps[row_start : row_start + 2]):
+                with cols[col_idx]:
+                    render_opportunity_card(opp)
+
+
+@st.fragment(run_every=REFRESH_INTERVAL_SEC, key="radar_live_cards")
+def render_live_radar_cards(interval: str, history_limit: int) -> None:
+    """
+    Radar tavsiye kartlarını 10 saniyede bir Binance anlık verisiyle yeniler.
+
+    Tam sayfa rerun yapmaz; tarama butonu ve geçmiş yerinde kalır.
+    """
+    opportunities = _filter_radar_opportunities(
+        st.session_state.get("scan_opportunities", [])
+    )
+    scan_stats: Optional[ScanStats] = st.session_state.get("scan_stats")
+
+    if not opportunities:
+        bos_mesaj = (scan_stats.mesaj if scan_stats else "") or (
+            "Şu an piyasada LONG veya SHORT sinyali bulunamadı — "
+            "BEKLE modunda kalmanız önerilir."
+        )
+        if scan_stats and scan_stats.incelenen == 0:
+            st.warning(bos_mesaj, icon="⚠️")
+        else:
+            st.info(bos_mesaj, icon="ℹ️")
+        return
+
+    refresh_count = int(st.session_state.get("radar_refresh_count", 0)) + 1
+    st.session_state.radar_refresh_count = refresh_count
+
+    try:
+        opportunities = refresh_radar_opportunities(
+            opportunities,
+            interval=interval,
+            history_limit=history_limit,
+        )
+        st.session_state.scan_opportunities = opportunities
+        st.session_state.radar_last_refresh_at = utc_now()
+    except Exception:
+        st.warning(
+            "Radar fiyatları yenilenemedi. Önceki tarama verileri gösteriliyor.",
+            icon="⚠️",
+        )
+
+    last_live = st.session_state.get("radar_last_refresh_at")
+    live_text = format_datetime_tr(last_live) if last_live else "—"
+    st.caption(
+        f":material/sync: Canlı radar · her {REFRESH_INTERVAL_SEC} sn · "
+        f"döngü {refresh_count} · son fiyat: {live_text}"
+    )
+    _render_radar_results(opportunities, scan_stats)
+
+
 def render_radar_tab(interval: str, history_limit: int) -> None:
     """Piyasa radarı ve tavsiyeler sekmesini çizer."""
     st.markdown("### Piyasa Radarı — Akıllı Coin Havuzu")
@@ -1767,9 +2023,6 @@ def render_radar_tab(interval: str, history_limit: int) -> None:
 
     render_recommendation_history()
 
-    opportunities: list[ScanOpportunity] = _filter_radar_opportunities(
-        st.session_state.get("scan_opportunities", [])
-    )
     scan_stats: Optional[ScanStats] = st.session_state.get("scan_stats")
 
     if not st.session_state.get("last_scan_at"):
@@ -1789,86 +2042,12 @@ def render_radar_tab(interval: str, history_limit: int) -> None:
             f"Hacim patlaması: {scan_stats.hacim_patlamasi_sayisi}"
         )
 
-    if not opportunities:
-        bos_mesaj = (scan_stats.mesaj if scan_stats else "") or (
-            "Şu an piyasada LONG veya SHORT sinyali bulunamadı — "
-            "BEKLE modunda kalmanız önerilir."
-        )
-        if scan_stats and scan_stats.incelenen == 0:
-            st.warning(bos_mesaj, icon="⚠️")
-        else:
-            st.info(bos_mesaj, icon="ℹ️")
-        st.caption(
-            "Akıllı havuz tarandı ancak strateji koşulları (trend yönü, EMA hizası, "
-            "RSI aralığı ve MACD histogramı) hiçbir seçili paritede tam sağlanmıyor "
-            "veya bazı pariteler veri hatası nedeniyle atlandı. "
-            "Yukarıdaki **Son Tavsiyeler** bölümünden önceki kayıtları takip edebilirsiniz."
-        )
+    if st.session_state.get("scan_in_progress", False):
+        st.info("Tarama sürüyor. Canlı fiyat yenilemesi tarama bitince başlar.")
         return
 
     st.markdown("#### 🎯 Güncel Tarama Sonuçları")
-
-    long_opps = [o for o in opportunities if _opp_signal_label(o) == "LONG"]
-    short_opps = [o for o in opportunities if _opp_signal_label(o) == "SHORT"]
-
-    pool_size = scan_stats.toplam if scan_stats else len(opportunities)
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Taranan Havuz", pool_size)
-    m2.metric("🟢 LONG", len(long_opps))
-    m3.metric("🔴 SHORT", len(short_opps))
-    if scan_stats:
-        m4.metric(
-            "Havuz Kaynağı",
-            f"T{scan_stats.trend_sayisi}/D{scan_stats.loser_sayisi}/H{scan_stats.hacim_patlamasi_sayisi}",
-            help="Trend / Düşen / Hacim patlaması kategorilerindeki parite sayıları",
-        )
-    else:
-        m4.metric("Toplam Sinyal", len(opportunities))
-
-    table_title_col, table_export_col = st.columns([3, 1])
-    with table_title_col:
-        st.markdown(f"#### Aktif Fırsatlar ({len(opportunities)} sinyal)")
-    with table_export_col:
-        export_filename = (
-            f"sinyalci_firsatlar_{utc_now().strftime('%Y%m%d_%H%M')}.xlsx"
-        )
-        st.download_button(
-            label="📥 Excel İndir",
-            data=opportunities_to_excel_bytes(opportunities),
-            file_name=export_filename,
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-            use_container_width=True,
-            key="download_radar_excel",
-        )
-
-    display_df = build_radar_export_dataframe(opportunities).drop(
-        columns=["Taranma Zamanı"]
-    )
-    st.dataframe(
-        _style_radar_dataframe(display_df),
-        use_container_width=True,
-        hide_index=True,
-    )
-
-    st.markdown("---")
-
-    if long_opps:
-        st.markdown("#### 🔥 Uzun (LONG) Fırsatları")
-        for row_start in range(0, len(long_opps), 2):
-            cols = st.columns(2)
-            for col_idx, opp in enumerate(long_opps[row_start : row_start + 2]):
-                with cols[col_idx]:
-                    render_opportunity_card(opp)
-
-    if short_opps:
-        if long_opps:
-            st.markdown("---")
-        st.markdown("#### 📉 Kısa (SHORT) Fırsatları")
-        for row_start in range(0, len(short_opps), 2):
-            cols = st.columns(2)
-            for col_idx, opp in enumerate(short_opps[row_start : row_start + 2]):
-                with cols[col_idx]:
-                    render_opportunity_card(opp)
+    render_live_radar_cards(interval=interval, history_limit=history_limit)
 
 
 # ---------------------------------------------------------------------------

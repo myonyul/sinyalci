@@ -1,6 +1,6 @@
 """Sinyalci - Modüler kripto al-sat sinyal botu."""
 
-from .data_engine import fetch_ohlcv, fetch_price_change_pct
+from .data_engine import fetch_live_tickers, fetch_ohlcv, fetch_last_prices, fetch_price_change_pct
 from .live_stream import LiveKlineStream, LiveStreamConfig, start_live_stream
 from .market_scanner import (
     BLACKLIST_BASES,
@@ -70,6 +70,8 @@ __all__ = [
     "estimate_target_eta",
     "evaluate_futures",
     "evaluate_signal",
+    "fetch_last_prices",
+    "fetch_live_tickers",
     "fetch_ohlcv",
     "fetch_price_change_pct",
     "get_strategy",

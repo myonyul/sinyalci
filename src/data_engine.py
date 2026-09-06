@@ -9,6 +9,7 @@ için hazır bir Pandas DataFrame döndürür. python-binance Client kullanılma
 from __future__ import annotations
 
 from typing import Any, Optional
+import json
 
 import pandas as pd
 import requests
@@ -26,6 +27,7 @@ _BINANCE_REST_HOSTS = (
 )
 _KLINES_PATH = "/api/v3/klines"
 _TICKER_PATH = "/api/v3/ticker/24hr"
+_PRICE_PATH = "/api/v3/ticker/price"
 _KLINES_LIMIT_MAX = 1000
 
 _session: Optional[requests.Session] = None
@@ -339,6 +341,95 @@ def fetch_all_tickers_24hr() -> list[dict[str, Any]]:
     if not isinstance(payload, list):
         raise ValueError("Binance 24s ticker yanıtı liste değil.")
     return payload
+
+
+def fetch_live_tickers(symbols: list[str]) -> dict[str, dict[str, float]]:
+    """
+    Seçili paritelerin anlık fiyat ve 24s değişimini tek istekle çeker.
+
+    ``GET /api/v3/ticker/24hr?symbols=[...]`` — başarısızsa
+    ``/api/v3/ticker/price`` yedeğine düşer.
+    """
+    unique = sorted({str(symbol).upper().strip() for symbol in symbols if symbol})
+    if not unique:
+        return {}
+
+    rows: list[dict[str, Any]] = []
+    try:
+        if len(unique) == 1:
+            payload = _public_get(_TICKER_PATH, {"symbol": unique[0]})
+            rows = [payload] if isinstance(payload, dict) else []
+        else:
+            payload = _public_get(
+                _TICKER_PATH,
+                {"symbols": json.dumps(unique, separators=(",", ":"))},
+            )
+            rows = payload if isinstance(payload, list) else []
+    except Exception:
+        rows = []
+
+    result: dict[str, dict[str, float]] = {}
+    for row in rows:
+        symbol = str(row.get("symbol") or "").upper()
+        if not symbol:
+            continue
+        try:
+            last_price = float(row.get("lastPrice") or 0)
+        except (TypeError, ValueError):
+            continue
+        if last_price <= 0:
+            continue
+        try:
+            change_pct = float(row.get("priceChangePercent") or 0)
+        except (TypeError, ValueError):
+            change_pct = 0.0
+        try:
+            quote_volume = float(row.get("quoteVolume") or 0)
+        except (TypeError, ValueError):
+            quote_volume = 0.0
+        result[symbol] = {
+            "last_price": last_price,
+            "price_change_pct": change_pct,
+            "quote_volume": quote_volume,
+        }
+
+    missing = [symbol for symbol in unique if symbol not in result]
+    if missing:
+        try:
+            if len(missing) == 1:
+                price_payload = _public_get(_PRICE_PATH, {"symbol": missing[0]})
+                price_rows = [price_payload] if isinstance(price_payload, dict) else []
+            else:
+                price_payload = _public_get(
+                    _PRICE_PATH,
+                    {"symbols": json.dumps(missing, separators=(",", ":"))},
+                )
+                price_rows = price_payload if isinstance(price_payload, list) else []
+            for row in price_rows:
+                symbol = str(row.get("symbol") or "").upper()
+                try:
+                    last_price = float(row.get("price") or 0)
+                except (TypeError, ValueError):
+                    continue
+                if symbol and last_price > 0:
+                    result[symbol] = {
+                        "last_price": last_price,
+                        "price_change_pct": 0.0,
+                        "quote_volume": 0.0,
+                    }
+        except Exception:
+            pass
+
+    return result
+
+
+def fetch_last_prices(symbols: list[str]) -> dict[str, float]:
+    """Paritelerin anlık son fiyatlarını döndürür."""
+    return {
+        symbol: data["last_price"]
+        for symbol, data in fetch_live_tickers(symbols).items()
+        if data.get("last_price", 0) > 0
+    }
 
 
 def fetch_price_change_pct(symbol: str) -> Optional[float]:
