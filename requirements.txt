@@ -21,4 +21,5 @@ streamlit
 pandas
 numpy
 python-binance
-pandas_ta
+streamlit-autorefresh
+openpyxl
